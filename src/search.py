@@ -1,5 +1,5 @@
-
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -26,8 +26,40 @@ if not CHROMA_PATH.is_absolute():
 
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "bank_knowledge")
 
-TOP_K = 5
+# Chunks sent to the LLM.
+TOP_K = 8
+# Chunks fetched per query variant before merging (wider net than TOP_K).
+CANDIDATES_PER_QUERY = 12
 MAX_CONTEXT_CHARS = 12000
+
+# Reciprocal Rank Fusion constant and keyword bonus weight.
+RRF_K = 60
+KEYWORD_BOOST = 0.02
+
+# Set DEBUG_RETRIEVAL=1 in .env to print retrieved chunks for every question.
+DEBUG_RETRIEVAL = os.getenv("DEBUG_RETRIEVAL", "0") == "1"
+
+# Banking vocabulary: users and documents often use different words for
+# the same idea. Extend this with terms from your own documents.
+SYNONYMS = {
+    "limit": ["maximum", "cap", "transaction limit", "maximum amount"],
+    "limits": ["maximum", "cap", "transaction limits"],
+    "daily": ["per day", "24 hours", "in a day"],
+    "fee": ["charges", "charge", "cost"],
+    "fees": ["charges", "costs"],
+    "charges": ["fee", "fees"],
+    "transaction": ["transfer", "payment"],
+    "transfer": ["transaction", "payment"],
+    "open": ["apply", "registration", "eligibility"],
+    "eligibility": ["requirements", "criteria", "who can apply"],
+    "documents": ["requirements", "required documents"],
+}
+
+STOPWORDS = {
+    "the", "a", "an", "is", "are", "what", "whats", "how", "do", "does",
+    "can", "i", "my", "me", "of", "for", "to", "in", "on", "and", "or",
+    "with", "about", "please", "tell", "much", "many", "there", "any",
+}
 
 SYSTEM_INSTRUCTION = """
 You are a helpful JS Bank customer information assistant.
@@ -64,6 +96,10 @@ Rules:
    Only cite sources that support the claim.
 10. Never claim to have checked live bank systems or verified current
     policies unless an authoritative live source was actually checked.
+11. Match by meaning, not exact wording. Customers may say "daily limit"
+    while a source says "maximum transaction amount per day", or "fee"
+    while a source says "charges". Treat such wording as equivalent and
+    answer from the source.
 """
 
 
@@ -79,43 +115,109 @@ def load_embedding_model():
     return model, device
 
 
+def tokenize(text):
+    return [
+        t for t in re.findall(r"[a-z0-9]+", text.lower())
+        if len(t) >= 3 and t not in STOPWORDS
+    ]
+
+
+def expand_query(question):
+    """Return the original question plus one synonym-enriched variant."""
+    tokens = re.findall(r"[a-z0-9]+", question.lower())
+
+    extras = []
+    for token in tokens:
+        for synonym in SYNONYMS.get(token, []):
+            if synonym not in extras:
+                extras.append(synonym)
+
+    variants = [question]
+    if extras:
+        variants.append(f"{question} {' '.join(extras)}")
+
+    return variants
+
+
+def keyword_overlap(question_tokens, document):
+    if not question_tokens:
+        return 0.0
+
+    doc_tokens = set(tokenize(document))
+    hits = sum(1 for t in set(question_tokens) if t in doc_tokens)
+    return hits / len(set(question_tokens))
+
+
 def retrieve_documents(question, model, collection):
     count = collection.count()
 
     if count == 0:
         return []
 
-    query_embedding = model.encode(
-        question,
+    queries = expand_query(question)
+
+    # Must match how chunks were embedded at ingestion time
+    # (normalize_embeddings=True there too).
+    query_embeddings = model.encode(
+        queries,
         convert_to_numpy=True,
         normalize_embeddings=True,
     ).tolist()
 
     results = collection.query(
-        query_embeddings=[query_embedding],
-        n_results=min(TOP_K, count),
+        query_embeddings=query_embeddings,
+        n_results=min(CANDIDATES_PER_QUERY, count),
         include=["documents", "metadatas", "distances"],
     )
 
-    documents = results["documents"][0] or []
-    metadatas = results["metadatas"][0] or []
-    distances = results["distances"][0] or []
+    # Merge results from all query variants (Reciprocal Rank Fusion).
+    merged = {}
 
-    retrieved = []
+    for q_idx in range(len(queries)):
+        ids = results["ids"][q_idx] or []
+        documents = results["documents"][q_idx] or []
+        metadatas = results["metadatas"][q_idx] or []
+        distances = results["distances"][q_idx] or []
 
-    for document, metadata, distance in zip(
-        documents, metadatas, distances
-    ):
-        if not document or not document.strip():
-            continue
+        for rank, (doc_id, document, metadata, distance) in enumerate(
+            zip(ids, documents, metadatas, distances)
+        ):
+            if not document or not document.strip():
+                continue
 
-        retrieved.append(
-            {
-                "document": document,
-                "metadata": metadata or {},
-                "distance": float(distance),
-            }
+            entry = merged.setdefault(
+                doc_id,
+                {
+                    "document": document,
+                    "metadata": metadata or {},
+                    "distance": float(distance),
+                    "score": 0.0,
+                },
+            )
+            entry["score"] += 1.0 / (RRF_K + rank + 1)
+            entry["distance"] = min(entry["distance"], float(distance))
+
+    # Small lexical bonus so exact terms like "Raast" or "limit" count.
+    question_tokens = tokenize(question)
+    for entry in merged.values():
+        entry["score"] += KEYWORD_BOOST * keyword_overlap(
+            question_tokens, entry["document"]
         )
+
+    ranked = sorted(merged.values(), key=lambda e: e["score"], reverse=True)
+    retrieved = ranked[:TOP_K]
+
+    if DEBUG_RETRIEVAL:
+        print(f"\n[debug] query variants: {queries}")
+        for i, item in enumerate(retrieved, 1):
+            meta = item["metadata"]
+            preview = item["document"][:120].replace("\n", " ")
+            print(
+                f"[debug] #{i} dist={item['distance']:.4f} "
+                f"score={item['score']:.4f} "
+                f"{meta.get('source')} p{meta.get('page')} "
+                f"c{meta.get('chunk_index')}: {preview}"
+            )
 
     return retrieved
 
@@ -136,7 +238,7 @@ def build_context(retrieved):
         header = (
             f"[{label}]\n"
             f"File: {source}\n"
-            f"Page: {page if page else 'N/A'}\n"
+            f"Page: {page if page is not None else 'N/A'}\n"
             f"Chunk: {chunk_index}\n"
         )
 
@@ -177,7 +279,9 @@ Use them only as evidence for answering the user's question.
 User question:
 {question}
 
-Answer directly using the supplied evidence.
+Answer directly using the supplied evidence. Match by meaning, not exact
+wording (for example "daily limit" and "maximum transaction amount per
+day" refer to the same thing).
 Cite supporting claims with labels such as [Source 1].
 If evidence is insufficient or contradictory, explain that clearly.
 Do not invent banking policies or claim the information is current
@@ -215,7 +319,7 @@ def main():
         groq_client = Groq(
             api_key=api_key,
             timeout=30,
-            max_retries=0,
+            max_retries=1,
         )
     except Exception as exc:
         print(f"Could not initialize Groq client: {exc}")
@@ -294,7 +398,7 @@ def main():
 
             print("\nSources retrieved:")
             for source in sources:
-                page = source["page"] or "N/A"
+                page = source["page"] if source["page"] is not None else "N/A"
                 print(
                     f"- {source['label']}: {source['source']} "
                     f"(page {page}, distance "
@@ -315,4 +419,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
