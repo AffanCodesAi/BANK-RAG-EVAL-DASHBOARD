@@ -119,11 +119,12 @@ This is an AI/RAG engineering portfolio project. Outputs should be independently
 
 ## Demo Screenshots
 
-<img width="1900" height="933" alt="image" src="https://github.com/user-attachments/assets/7ea5b4e0-0795-4504-a675-9b0bdd5b5f62" />
-
 <img width="1900" height="933" alt="image" src="https://github.com/user-attachments/assets/5c678068-34c8-4ac0-bc2d-05e887f3a5eb" />
 
+<img width="1900" height="933" alt="image" src="https://github.com/user-attachments/assets/400a6f28-c850-4de5-b0ee-f442f49a92a1" />
+
 <img width="1900" height="933" alt="image" src="https://github.com/user-attachments/assets/8de249cb-9d33-467c-86cb-28fb45536418" />
+
 
 
 
