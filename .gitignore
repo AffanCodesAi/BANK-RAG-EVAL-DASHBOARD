@@ -1,0 +1,35 @@
+.venv/
+.env
+__pycache__/
+*.py[cod]
+.pytest_cache/
+chroma_db/
+data/raw/*
+data/processed/*
+evaluation/results/
+logs/
+dashboard_data/
+frontend/node_modules/
+frontend/dist/
+
+# Local runtime data
+*.log
+logs/
+dashboard_data/
+frontend/dist/
+frontend/node_modules/
+.DS_Store
+
+# Local databases
+*.sqlite
+*.sqlite3
+*.db
+
+# Secrets
+.env.*
+!.env.example
+lol.txt
+data/documents/
+src/search.py.bak
+data/documents/
+src/search.py.bak

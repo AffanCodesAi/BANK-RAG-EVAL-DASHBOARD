@@ -1,0 +1,11 @@
+
+google-genai
+chromadb
+sentence-transformers
+pymupdf
+python-docx
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+groq
